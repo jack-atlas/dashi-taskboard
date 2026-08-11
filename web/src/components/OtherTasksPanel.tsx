@@ -90,7 +90,7 @@ interface OtherTasksPanelProps {
   restoringTaskId: string | null;
   deletingTaskId: string | null;
   onTabChange: (tab: OtherTaskTab) => void;
-  onCreate: (status: Exclude<OtherTaskTab, "archived">) => void;
+  onCreate?: (status: Exclude<OtherTaskTab, "archived">) => void;
   onRestore: (task: Task) => void;
   onDelete: (task: Task) => void;
   onEdit: (task: Task) => void;
@@ -212,7 +212,7 @@ export function OtherTasksPanel({
         })}
       </div>
 
-      {!archived && (
+      {!archived && onCreate && (
         <button
           className="other-tasks-add"
           type="button"

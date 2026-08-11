@@ -11,6 +11,7 @@ import type {
   DevelopmentScan,
   HostContext,
   IssueRelationType,
+  JiraConnection,
   Project,
   ProjectSummary,
   Task,
@@ -94,6 +95,50 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 export async function listProjects(signal?: AbortSignal): Promise<Project[]> {
   const data = await request<{ projects: Project[] }>("/api/projects", { signal });
   return data.projects;
+}
+
+export async function getJiraConnection(signal?: AbortSignal): Promise<JiraConnection> {
+  try {
+    const data = await request<{ connection: JiraConnection }>("/api/local/jira-connection", { signal });
+    return data.connection;
+  } catch (error) {
+    if (
+      error instanceof ApiError
+      && (error.code === "LOCAL_COMPANION_REQUIRED" || error.status === 404)
+    ) {
+      return {
+        configured: false,
+        baseUrl: null,
+        username: null,
+        displayName: null,
+        projects: [],
+        projectId: "jira-my-tasks",
+        lastSyncedAt: null,
+        insecureHttp: false,
+      };
+    }
+    throw error;
+  }
+}
+
+export async function configureJiraConnection(input: {
+  baseUrl: string;
+  username: string;
+  password: string;
+  projects: string[];
+}): Promise<JiraConnection> {
+  const data = await request<{ connection: JiraConnection }>("/api/local/jira-connection", {
+    method: "PUT",
+    body: JSON.stringify(input),
+  });
+  return data.connection;
+}
+
+export async function syncJiraConnection(): Promise<JiraConnection> {
+  const data = await request<{ connection: JiraConnection }>("/api/local/jira-connection/sync", {
+    method: "POST",
+  });
+  return data.connection;
 }
 
 export async function getProjectSummary(

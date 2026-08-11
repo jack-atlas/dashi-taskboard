@@ -11,6 +11,7 @@ import { promisify } from "node:util";
 
 import {
   DEFAULT_PROJECT_ID,
+  JIRA_PROJECT_ID,
   TASK_STATUSES,
   isTaskPriority,
   isTaskStatus,
@@ -27,6 +28,8 @@ import {
   isLocalCompanionRoute,
 } from "./cloud-proxy.mjs";
 import { ApiError, TaskboardDatabase } from "./database.mjs";
+import { createJiraConfigStore } from "./jira-config.mjs";
+import { createJiraIntegration } from "./jira-integration.mjs";
 import { ProjectSummaryService } from "./project-summary.mjs";
 
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -1307,6 +1310,7 @@ export function resolveServerOptions(options = {}) {
     databasePath: options.databasePath ?? path.join(dataDirectory, "taskboard.sqlite"),
     attachmentsDirectory: options.attachmentsDirectory ?? path.join(dataDirectory, "attachments"),
     cloudConfigPath: options.cloudConfigPath ?? path.join(dataDirectory, "cloud-companion.json"),
+    jiraConfigPath: options.jiraConfigPath ?? path.join(dataDirectory, "jira-connection.json"),
     clientStoragePath: options.clientStoragePath ?? path.join(dataDirectory, "client-storage.json"),
     staticDirectory: options.staticDirectory ?? path.join(PROJECT_ROOT, "dist", "web"),
     skillPath: options.skillPath ?? path.join(PROJECT_ROOT, "skills", "manage-taskboard", "SKILL.md"),
@@ -1379,6 +1383,14 @@ export function createTaskboardServer(options = {}) {
   }
   const cloudConfig = options.cloudConfigStore ?? createCloudConfigStore({
     configPath: resolved.cloudConfigPath,
+  });
+  const jiraConfig = options.jiraConfigStore ?? createJiraConfigStore({
+    configPath: resolved.jiraConfigPath,
+  });
+  const jira = createJiraIntegration({
+    configStore: jiraConfig,
+    database,
+    fetch: options.jiraFetch ?? globalThis.fetch,
   });
   const cloudProxy = createCloudProxy({
     configStore: cloudConfig,
@@ -1824,6 +1836,56 @@ export function createTaskboardServer(options = {}) {
         return methodNotAllowed(response, ["GET", "PUT", "DELETE"]);
       }
 
+      if (pathname === "/api/local/jira-connection") {
+        if ([...url.searchParams.keys()].length > 0) {
+          throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "Jira 连接接口不接受查询参数");
+        }
+        if (request.method === "GET") {
+          return sendJson(response, 200, { connection: await jira.status() });
+        }
+        if (request.method === "PUT") {
+          const activeCloudConfig = await cloudConfig.read();
+          if (activeCloudConfig.remoteUrl) {
+            throw new ApiError(
+              409,
+              "JIRA_LOCAL_MODE_REQUIRED",
+              "Jira 连接当前仅支持本地数据模式，请先退出云端协作模式",
+            );
+          }
+          const body = await readJson(request);
+          assertPlainObject(body);
+          assertAllowedKeys(body, new Set(["baseUrl", "username", "password", "projects"]));
+          const baseUrl = stringField(body.baseUrl, "baseUrl", { required: true, maxLength: 2048 });
+          const username = stringField(body.username ?? "", "username", { maxLength: 254 });
+          const password = stringField(body.password ?? "", "password", { maxLength: 4096 });
+          try {
+            const connection = await jira.configure({
+              baseUrl,
+              username,
+              password,
+              projects: body.projects,
+            });
+            events.emit("project.updated", { project: database.getProject(JIRA_PROJECT_ID) });
+            return sendJson(response, 200, { connection });
+          } catch (error) {
+            if (error instanceof ApiError) throw error;
+            throw new ApiError(400, error.code ?? "INVALID_JIRA_CONFIG", error.message);
+          }
+        }
+        return methodNotAllowed(response, ["GET", "PUT"]);
+      }
+
+      if (pathname === "/api/local/jira-connection/sync") {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        if ([...url.searchParams.keys()].length > 0) {
+          throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "Jira 同步接口不接受查询参数");
+        }
+        await assertEmptyRequestBody(request, "POST /api/local/jira-connection/sync");
+        const connection = await jira.sync({ force: true });
+        events.emit("project.updated", { project: database.getProject(JIRA_PROJECT_ID) });
+        return sendJson(response, 200, { connection });
+      }
+
       const projectMappingRoute = pathname.match(/^\/api\/local\/project-mappings\/([^/]+)$/);
       if (projectMappingRoute) {
         if (request.method !== "PUT") return methodNotAllowed(response, ["PUT"]);
@@ -2145,11 +2207,20 @@ export function createTaskboardServer(options = {}) {
 
       if (pathname === "/api/tasks") {
         if (request.method === "GET") {
-          return sendJson(response, 200, { tasks: database.listTasks(parseTaskFilters(url.searchParams)) });
+          const filters = parseTaskFilters(url.searchParams);
+          if (filters.projectId === JIRA_PROJECT_ID) await jira.sync();
+          return sendJson(response, 200, { tasks: database.listTasks(filters) });
         }
         if (request.method === "POST") {
           const actor = actorFromRequest(request);
           const { assigneeTarget, ...input } = parseTaskCreate(await readJson(request));
+          if (input.projectId === JIRA_PROJECT_ID) {
+            throw new ApiError(
+              409,
+              "JIRA_CREATE_UNAVAILABLE",
+              "请在 Jira 中新建议题，Taskboard 当前只同步已分配给你的任务",
+            );
+          }
           const task = database.createTask({
             ...input,
             actor,
@@ -2478,6 +2549,23 @@ export function createTaskboardServer(options = {}) {
         if (!action && request.method === "PATCH") {
           const actor = actorFromRequest(request);
           const { version, changes, threadId, assigneeTarget } = parseTaskPatch(await readJson(request));
+          const current = database.getTask(id);
+          if (!current) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${id}' does not exist`);
+          if (current.source === "jira") {
+            if (current.version !== version) {
+              throw new ApiError(409, "VERSION_CONFLICT", "Task changed since it was last read", {
+                expectedVersion: version,
+                actualVersion: current.version,
+              });
+            }
+            if (Object.hasOwn(changes, "projectId")) {
+              throw new ApiError(409, "JIRA_PROJECT_MOVE_UNAVAILABLE", "Jira 任务不能移到本地项目");
+            }
+            if (assigneeTarget !== undefined) {
+              throw new ApiError(409, "JIRA_ASSIGNEE_UNAVAILABLE", "请在 Jira 中修改经办人");
+            }
+            await jira.updateTask(current, changes);
+          }
           if (assigneeTarget !== undefined) {
             changes.assignee = resolveAssignee(assigneeTarget, actor);
           }
@@ -2486,6 +2574,10 @@ export function createTaskboardServer(options = {}) {
           return sendJson(response, 200, { task });
         }
         if (!action && request.method === "DELETE") {
+          const current = database.getTask(id);
+          if (current?.source === "jira") {
+            throw new ApiError(409, "JIRA_DELETE_UNAVAILABLE", "Jira 任务不能从 Taskboard 永久删除");
+          }
           const { version } = parseArchive(await readJson(request));
           const deleted = database.deleteArchivedTask(id, version);
           for (const attachmentId of deleted.attachmentIds) {
@@ -2500,6 +2592,17 @@ export function createTaskboardServer(options = {}) {
         }
         if (action === "move" && request.method === "POST") {
           const move = parseMove(await readJson(request));
+          const current = database.getTask(id);
+          if (!current) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${id}' does not exist`);
+          if (current.source === "jira") {
+            if (current.version !== move.version) {
+              throw new ApiError(409, "VERSION_CONFLICT", "Task changed since it was last read", {
+                expectedVersion: move.version,
+                actualVersion: current.version,
+              });
+            }
+            await jira.moveTask(current, move.status);
+          }
           const task = database.moveTask(
             id,
             move.version,
@@ -2512,12 +2615,20 @@ export function createTaskboardServer(options = {}) {
           return sendJson(response, 200, { task });
         }
         if (action === "archive" && request.method === "POST") {
+          const current = database.getTask(id);
+          if (current?.source === "jira") {
+            throw new ApiError(409, "JIRA_ARCHIVE_UNAVAILABLE", "Jira 任务由同步范围自动管理，不能手动归档");
+          }
           const { version, threadId } = parseArchive(await readJson(request));
           const task = database.archiveTask(id, version, threadId, actorFromRequest(request));
           events.emit("task.archived", { task });
           return sendJson(response, 200, { task });
         }
         if (action === "restore" && request.method === "POST") {
+          const current = database.getTask(id);
+          if (current?.source === "jira") {
+            throw new ApiError(409, "JIRA_RESTORE_UNAVAILABLE", "Jira 任务由同步范围自动管理，不能手动恢复");
+          }
           const { version, threadId } = parseArchive(await readJson(request));
           const task = database.restoreTask(id, version, threadId, actorFromRequest(request));
           events.emit("task.restored", { task });

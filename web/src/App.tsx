@@ -24,10 +24,12 @@ import {
   archiveTask as archiveTaskRequest,
   createProject as createProjectRequest,
   createTask as createTaskRequest,
+  configureJiraConnection,
   deleteArchivedTask as deleteArchivedTaskRequest,
   deleteProject as deleteProjectRequest,
   getCodexThreadProgress,
   getHostRuntime,
+  getJiraConnection,
   getTaskboardRevision,
   getWorkflowWorkspace,
   getTaskboardMetadata,
@@ -42,6 +44,7 @@ import {
   resolveTaskboardUrl,
   restoreTask as restoreTaskRequest,
   setCurrentUserActor,
+  syncJiraConnection,
   uploadAttachment,
   updateTask as updateTaskRequest,
 } from "./api";
@@ -54,6 +57,7 @@ import { BoardColumn, STATUS_DETAILS } from "./components/BoardColumn";
 import { AiChat, type AiChatOpenThreadRequest } from "./components/AiChat";
 import { DashboardView } from "./components/DashboardView";
 import { IssueListView } from "./components/IssueListView";
+import { JiraConnectionDialog } from "./components/JiraConnectionDialog";
 import { OtherTasksPanel } from "./components/OtherTasksPanel";
 import {
   resolveInlineMediaMarkdown,
@@ -99,6 +103,7 @@ import {
   type DevelopmentScan,
   type HostContext,
   type IssueRelationType,
+  type JiraConnection,
   type Project,
   type Task,
   type TaskboardMetadata,
@@ -640,6 +645,11 @@ export function App() {
   const [projectContextMenu, setProjectContextMenu] = useState<ProjectContextMenuState | null>(null);
   const [projectCreateOpen, setProjectCreateOpen] = useState(false);
   const [projectName, setProjectName] = useState("");
+  const [jiraDialogOpen, setJiraDialogOpen] = useState(false);
+  const [jiraConnection, setJiraConnection] = useState<JiraConnection | null>(null);
+  const [jiraSaving, setJiraSaving] = useState(false);
+  const [jiraSyncing, setJiraSyncing] = useState(false);
+  const [jiraError, setJiraError] = useState<string | null>(null);
   const [pendingProjectDelete, setPendingProjectDelete] = useState<ProjectChoice | null>(null);
   const [projectDeleteIssueCount, setProjectDeleteIssueCount] = useState<number | null>(null);
   const [deletingProjectId, setDeletingProjectId] = useState<string | null>(null);
@@ -700,6 +710,7 @@ export function App() {
   }, []);
 
   const selectedProject = projects.find((project) => project.id === selectedProjectId) ?? null;
+  const isJiraProject = selectedProject?.source === "jira";
   useLayoutEffect(() => {
     if (selectedProject) rememberProjectOpen(selectedProject.id);
   }, [rememberProjectOpen, selectedProject]);
@@ -1346,6 +1357,7 @@ export function App() {
         getTaskboardMetadata(signal),
         listDeviceWorkspaces(signal),
       ]);
+      const nextJiraConnection = await getJiraConnection(signal);
       setTaskboardMetadata((current) => (
         current
         && current.mode === metadata.mode
@@ -1366,6 +1378,7 @@ export function App() {
         return next;
       });
       setProjects(nextProjects);
+      setJiraConnection(nextJiraConnection);
       setSelectedProjectId((current) => {
         const fromQuery = new URLSearchParams(window.location.search).get("project");
         if (fromQuery && nextProjects.some((project) => project.id === fromQuery)) return fromQuery;
@@ -1430,6 +1443,14 @@ export function App() {
     void refreshTasks(selectedProjectId, { signal: controller.signal });
     return () => controller.abort();
   }, [refreshTasks, selectedProjectId]);
+
+  useEffect(() => {
+    if (!isJiraProject || !selectedProjectId) return;
+    const timer = window.setInterval(() => {
+      void refreshTasks(selectedProjectId, { quiet: true });
+    }, 60_000);
+    return () => window.clearInterval(timer);
+  }, [isJiraProject, refreshTasks, selectedProjectId]);
 
   const refreshWorkflowOptions = useCallback(async (projectId: string, signal?: AbortSignal) => {
     const record = await getWorkflowWorkspace<unknown>(projectId, signal);
@@ -1592,6 +1613,7 @@ export function App() {
         && !event.metaKey
         && !event.ctrlKey
         && selectedProjectId
+        && !isJiraProject
         && boardView !== "workflow"
       ) {
         event.preventDefault();
@@ -1613,7 +1635,7 @@ export function App() {
 
     window.addEventListener("keydown", handleShortcut);
     return () => window.removeEventListener("keydown", handleShortcut);
-  }, [boardView, contextMenu, detailTaskId, editor, projectMenuOpen, selectedProjectId]);
+  }, [boardView, contextMenu, detailTaskId, editor, isJiraProject, projectMenuOpen, selectedProjectId]);
 
   const filteredTasks = useMemo(() => {
     return tasks.filter(
@@ -2174,6 +2196,57 @@ export function App() {
     }
   }
 
+  function openJiraDialog() {
+    setProjectMenuOpen(false);
+    setProjectContextMenu(null);
+    setJiraError(null);
+    setJiraDialogOpen(true);
+  }
+
+  async function saveJiraConnection(input: {
+    baseUrl: string;
+    username: string;
+    password: string;
+    projects: string[];
+  }) {
+    if (jiraSaving) return;
+    setJiraSaving(true);
+    setJiraError(null);
+    try {
+      const connection = await configureJiraConnection(input);
+      const nextProjects = await listProjects();
+      setJiraConnection(connection);
+      setProjects(nextProjects);
+      setJiraDialogOpen(false);
+      changeProject(connection.projectId);
+      await refreshTasks(connection.projectId);
+      setAnnouncement(`已同步 ${connection.displayName ?? connection.username} 的 Jira 任务`);
+    } catch (error) {
+      setJiraError(errorMessage(error));
+    } finally {
+      setJiraSaving(false);
+    }
+  }
+
+  async function syncJiraNow() {
+    if (jiraSyncing || !selectedProjectId) return;
+    setJiraSyncing(true);
+    setActionError(null);
+    try {
+      const connection = await syncJiraConnection();
+      setJiraConnection(connection);
+      await Promise.all([
+        refreshTasks(selectedProjectId, { quiet: true }),
+        refreshProjectList(),
+      ]);
+      setAnnouncement("Jira 任务已同步");
+    } catch (error) {
+      setActionError(errorMessage(error));
+    } finally {
+      setJiraSyncing(false);
+    }
+  }
+
   function openCreateProjectDialog() {
     setProjectMenuOpen(false);
     setProjectContextMenu(null);
@@ -2383,6 +2456,15 @@ export function App() {
                       type="button"
                       role="menuitem"
                       disabled={openingProjectId !== null}
+                      onClick={openJiraDialog}
+                    >
+                      <LinearIcon className="project-avatar" name="link" />
+                      <span>{jiraConnection?.configured ? "Jira 设置" : "连接 Jira"}</span>
+                    </button>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      disabled={openingProjectId !== null}
                       onClick={openCreateProjectDialog}
                     >
                       <TaskboardIcon className="project-avatar" name="create" />
@@ -2407,7 +2489,19 @@ export function App() {
                 onChange={(options) => void saveProjectAutomation(options)}
               />
             )}
-            {selectedProjectId && boardView !== "workflow" && (
+            {isJiraProject && (
+              <button
+                className="icon-button"
+                type="button"
+                disabled={jiraSyncing}
+                onClick={() => void syncJiraNow()}
+                aria-label="同步 Jira"
+                title="同步 Jira"
+              >
+                <LinearIcon name="recurrence" />
+              </button>
+            )}
+            {selectedProjectId && !isJiraProject && boardView !== "workflow" && (
               <button
                 className="icon-button header-create-button"
                 type="button"
@@ -2676,6 +2770,7 @@ export function App() {
                         contextMenuTaskId={contextMenu?.taskId ?? null}
                         availableLabels={availableLabels}
                         currentUser={currentUser}
+                        createEnabled={!isJiraProject}
                         onCreate={(initialStatus) => setEditor({ task: null, status: initialStatus })}
                         onEdit={openTaskDetail}
                         onUpdate={updateTaskProperties}
@@ -2710,7 +2805,9 @@ export function App() {
                     restoringTaskId={restoringTaskId}
                     deletingTaskId={deletingArchivedTaskId}
                     onTabChange={setOtherTasksTab}
-                    onCreate={(initialStatus) => setEditor({ task: null, status: initialStatus })}
+                    onCreate={isJiraProject
+                      ? undefined
+                      : (initialStatus) => setEditor({ task: null, status: initialStatus })}
                     onRestore={(task) => void restoreArchivedTask(task)}
                     onDelete={setPendingArchivedTaskDelete}
                     onEdit={openTaskDetail}
@@ -2747,6 +2844,18 @@ export function App() {
             <span className="context-menu-label">删除项目</span>
           </button>
         </div>
+      )}
+
+      {jiraDialogOpen && (
+        <JiraConnectionDialog
+          connection={jiraConnection}
+          saving={jiraSaving}
+          error={jiraError}
+          onClose={() => {
+            if (!jiraSaving) setJiraDialogOpen(false);
+          }}
+          onSave={saveJiraConnection}
+        />
       )}
 
       {projectCreateOpen && (

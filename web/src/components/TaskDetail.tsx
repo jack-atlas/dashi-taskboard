@@ -1172,6 +1172,19 @@ export function TaskDetail({
                 <ActorAvatar actor={CODEX_AGENT_ACTOR} className="detail-thread-avatar" />
                 <span>{openingThread ? "正在打开…" : "在对话中打开"}</span>
               </button>
+              {currentTask.externalUrl && (
+                <a
+                  className="detail-copy-action detail-external-action"
+                  href={currentTask.externalUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  <span className="detail-copy-action-icon" aria-hidden="true">
+                    <LinearIcon name="openExternal" />
+                  </span>
+                  <span className="detail-copy-action-label">打开 Jira</span>
+                </a>
+              )}
               <button
                 className="detail-copy-action"
                 type="button"

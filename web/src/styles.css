@@ -4036,6 +4036,11 @@ kbd {
 
 .detail-copy-action {
   min-width: 0;
+  text-decoration: none;
+}
+
+.detail-external-action {
+  grid-column: 1 / -1;
 }
 
 .detail-copy-action-icon {
@@ -4428,6 +4433,15 @@ kbd {
 .project-create-dialog input:focus {
   border-color: var(--accent);
   box-shadow: 0 0 0 2px var(--accent-soft);
+}
+
+.jira-connection-dialog {
+  width: min(400px, 100%);
+}
+
+.delete-dialog .jira-http-warning {
+  margin-top: 7px;
+  color: var(--warning-text, #9a6700);
 }
 
 .delete-dialog .project-dialog-error {

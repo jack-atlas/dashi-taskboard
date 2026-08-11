@@ -76,6 +76,7 @@ interface BoardColumnProps {
   contextMenuTaskId: string | null;
   availableLabels: string[];
   currentUser: ActorIdentity;
+  createEnabled?: boolean;
   onCreate: (status: TaskStatus) => void;
   onEdit: (task: Task) => void;
   onUpdate: (task: Task, changes: Partial<TaskDraft>) => Promise<Task>;
@@ -103,6 +104,7 @@ export function BoardColumn({
   contextMenuTaskId,
   availableLabels,
   currentUser,
+  createEnabled = true,
   onCreate,
   onEdit,
   onUpdate,
@@ -182,17 +184,19 @@ export function BoardColumn({
           </span>
           <h2 id={`column-${status}`}>{details.label}</h2>
         </div>
-        <div className="column-actions">
-          <button
-            type="button"
-            className="icon-button add-task-button"
-            onClick={() => onCreate(status)}
-            aria-label={`在${details.label}中新建议题`}
-            title={`添加到${details.label}`}
-          >
-            <TaskboardIcon name={COLUMN_ADD_ICONS[status] ?? "columnAdd"} />
-          </button>
-        </div>
+        {createEnabled && (
+          <div className="column-actions">
+            <button
+              type="button"
+              className="icon-button add-task-button"
+              onClick={() => onCreate(status)}
+              aria-label={`在${details.label}中新建议题`}
+              title={`添加到${details.label}`}
+            >
+              <TaskboardIcon name={COLUMN_ADD_ICONS[status] ?? "columnAdd"} />
+            </button>
+          </div>
+        )}
       </header>
 
       <div className="column-list" ref={scrollRef}>
